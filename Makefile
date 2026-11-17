@@ -13,7 +13,7 @@ all:
 	cmake --build $(BUILD) -j
 
 test: all
-	./$(BUILD)/ps5ai-11dim --self-test
+	./$(BUILD)/11dim-ai-test --self-test
 
 clean:
 	rm -rf $(BUILD)

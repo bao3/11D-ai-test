@@ -52,12 +52,12 @@ struct Options {
 
 void print_help() {
     std::cout
-        << "ps5ai-11dim — PS5AI eleven-dimension LLM benchmark (C++17, Linux & macOS)\n"
+        << "11dim-ai-test — 11D AI Test eleven-dimension LLM benchmark (C++17, Linux & macOS)\n"
         << "\n"
         << "Usage:\n"
-        << "  ps5ai-11dim --model <name> [options]\n"
-        << "  ps5ai-11dim --self-test\n"
-        << "  ps5ai-11dim --help\n"
+        << "  11dim-ai-test --model <name> [options]\n"
+        << "  11dim-ai-test --self-test\n"
+        << "  11dim-ai-test --help\n"
         << "\n"
         << "Options:\n"
         << "  --api-url <url>               OpenAI-compatible chat completions endpoint\n"
@@ -289,7 +289,7 @@ int run_benchmark(const Options& opt) {
     const std::string cxx = resolve_cxx_compiler();
     const std::string cxx_ver = cxx_version_line(cxx);
     std::cout << std::string(78, '=') << "\n";
-    std::cout << "PS5AI 十一维评测 | 模型: " << opt.model;
+    std::cout << "11D AI Test 十一维评测 | 模型: " << opt.model;
     if (wire_model != opt.model) {
         std::cout << " (请求 ID: " << wire_model << ")";
     }

@@ -30,7 +30,7 @@ jobs:
       - name: Build
         run: cmake -S . -B build -DCMAKE_CXX_COMPILER=g++ && cmake --build build -j"$(nproc)"
       - name: Self-test
-        run: ./build/ps5ai-11dim --self-test
+        run: ./build/11dim-ai-test --self-test
 
   selftest-macos:
     runs-on: macos-latest
@@ -41,4 +41,4 @@ jobs:
       - name: Build
         run: cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++ && cmake --build build -j"$(sysctl -n hw.ncpu)"
       - name: Self-test
-        run: ./build/ps5ai-11dim --self-test
+        run: ./build/11dim-ai-test --self-test

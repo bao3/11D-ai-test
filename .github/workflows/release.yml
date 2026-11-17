@@ -2,7 +2,7 @@ name: release
 
 # Formal Release only when someone pushes a tag v* (a new commit pointed at
 # by that tag). No schedule, no workflow_dispatch: docs-only pushes do not
-# rebuild or upload, and v1.0 assets are left untouched.
+# rebuild or upload, and legacy v1.0 assets are left untouched.
 on:
   push:
     tags: ['v*']
@@ -21,13 +21,13 @@ jobs:
           cmake -S . -B build -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Release -DPS5AI_STATIC_CXX=ON
           cmake --build build -j"$(nproc)"
       - name: Self-test with the bundled toolchain
-        run: PS5AI_TOOLCHAIN="$HOME/ps5ai-toolchain" ./build/ps5ai-11dim --self-test
+        run: PS5AI_TOOLCHAIN="$HOME/ps5ai-toolchain" ./build/11dim-ai-test --self-test
       - name: Pack archive
         run: bash scripts/pack-release.sh build "$HOME/ps5ai-toolchain" dist
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-amd64
-          path: dist/ps5ai-11dim-linux-amd64.tar.gz
+          path: dist/11dim-ai-test-linux-amd64.tar.gz
 
   build-macos:
     runs-on: macos-latest
@@ -43,39 +43,40 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
           cmake --build build -j"$(sysctl -n hw.ncpu)"
       - name: Self-test
-        run: ./build/ps5ai-11dim --self-test
+        run: ./build/11dim-ai-test --self-test
       - name: Pack macOS archive
         run: |
-          NAME="ps5ai-11dim-macos-universal"
+          NAME="11dim-ai-test-macos-universal"
           STAGE="$(mktemp -d)"
           mkdir -p "${STAGE}/${NAME}" dist
-          cp build/ps5ai-11dim "${STAGE}/${NAME}/ps5ai-11dim"
-          chmod 0755 "${STAGE}/${NAME}/ps5ai-11dim"
-          strip -x "${STAGE}/${NAME}/ps5ai-11dim" || true
+          cp build/11dim-ai-test "${STAGE}/${NAME}/11dim-ai-test"
+          chmod 0755 "${STAGE}/${NAME}/11dim-ai-test"
+          strip -x "${STAGE}/${NAME}/11dim-ai-test" || true
           cat > "${STAGE}/${NAME}/README-run.txt" <<'EOF'
-          ps5ai-11dim macOS Universal (Apple Silicon arm64 + Intel x86_64)
+          11dim-ai-test macOS Universal (Apple Silicon arm64 + Intel x86_64)
 
           1. 若系统提示未签名拦截，先移除隔离属性：
-             xattr -d com.apple.quarantine ./ps5ai-11dim 2>/dev/null || true
+             xattr -d com.apple.quarantine ./11dim-ai-test 2>/dev/null || true
 
           2. 第 3 维沙盒依赖系统 C++17 编译器（Xcode Command Line Tools）：
              xcode-select --install
 
           3. 离线自检与评测示例：
-             ./ps5ai-11dim --self-test
-             GEMINI_API_KEY="AIza..." ./ps5ai-11dim --api-mode gemini --model gemini-4-hydrogen
-             OPENAI_API_KEY="sk-..." ./ps5ai-11dim --api-mode openai --model gpt-5
+             ./11dim-ai-test --self-test
+             ./11dim-ai-test --api-mode vertex --model gemini-4-hydrogen
+             GEMINI_API_KEY="AIza..." ./11dim-ai-test --api-mode gemini --model gemini-4-hydrogen
+             OPENAI_API_KEY="sk-..." ./11dim-ai-test --api-mode openai --model gpt-5
           EOF
           (
             cd "${STAGE}/${NAME}"
-            shasum -a 256 ./ps5ai-11dim ./README-run.txt > SHA256SUMS
+            shasum -a 256 ./11dim-ai-test ./README-run.txt > SHA256SUMS
           )
           tar -C "${STAGE}" -czf "dist/${NAME}.tar.gz" "${NAME}"
           rm -rf "${STAGE}"
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos-universal
-          path: dist/ps5ai-11dim-macos-universal.tar.gz
+          path: dist/11dim-ai-test-macos-universal.tar.gz
 
   publish:
     runs-on: ubuntu-latest
@@ -96,4 +97,4 @@ jobs:
           TAG="${GITHUB_REF_NAME}"
           gh release create "$TAG" *.tar.gz SHA256SUMS \
             --title "$TAG" \
-            --notes "Release bundles for Linux amd64 (with portable g++ toolchain for dimension 3) and macOS Universal (arm64 + x86_64). Includes multi-provider OpenAI compatibility (--api-mode gemini/openai/anthropic/deepseek/openrouter/compat/local)."
+            --notes "11D AI Test release bundles for Linux amd64 (with portable g++ toolchain for dimension 3) and macOS Universal (arm64 + x86_64). Supports local llama-server/vLLM and cloud OpenAI-compatible APIs (--api-mode vertex/gemini/openai/anthropic/deepseek/openrouter/compat/local)."

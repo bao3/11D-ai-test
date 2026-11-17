@@ -10,6 +10,7 @@ cmake-build-*/
 *.o
 *.a
 *.so
+11dim-ai-test
 ps5ai-11dim
 benchmark_report_v3.md
 benchmark_report_v3.json

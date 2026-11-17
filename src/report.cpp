@@ -39,7 +39,7 @@ Report build_report(const ReportInput& in) {
     const double avg_tok = time_sum > 0.0 ? static_cast<double>(token_sum) / time_sum : 0.0;
 
     std::ostringstream md;
-    md << "# 本地大模型十一维能力与性能评测报告 (v3.0 cpp)\n";
+    md << "# 大模型十一维能力与性能评测报告 (11D AI Test)\n";
     md << "- **测试模型**: `" << in.model << "`\n";
     md << "- **接口地址**: `" << in.api_url << "`\n";
     if (!in.api_mode.empty()) {

@@ -890,7 +890,7 @@ LlmResponse LlmClient::complete(const std::vector<ChatMessage>& messages, double
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
         curl_easy_setopt(curl, CURLOPT_HEADERDATA, &retry_after_s);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "ps5ai-11dim/1.1");
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "11dim-ai-test/1.2");
 
         const auto started = std::chrono::steady_clock::now();
         const CURLcode rc = curl_easy_perform(curl);

@@ -91,7 +91,7 @@ void check_compiler_probe() {
     const std::string exe_dir = executable_dir();
     CHECK(!exe_dir.empty());
     if (!exe_dir.empty()) {
-        CHECK(access((exe_dir + "/ps5ai-11dim").c_str(), X_OK) == 0);
+        CHECK(access((exe_dir + "/11dim-ai-test").c_str(), X_OK) == 0);
     }
 
     EnvRestore cxx_env("PS5AI_CXX");
@@ -255,7 +255,7 @@ void expect_score(const char* name, const ScoreResult& got, double want) {
 }  // namespace
 
 int run_self_test() {
-    std::cout << "ps5ai-11dim self-test (offline, no LLM)\n";
+    std::cout << "11dim-ai-test self-test (offline, no LLM)\n";
 
     CHECK(utf8_len("你好") == 2);
     CHECK(utf8_len("A好") == 2);

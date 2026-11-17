@@ -1,368 +1,250 @@
-# 11-dim-local-LM-Test
+# 11D AI Test (`11D-ai-test`)
 
-这是我们自己在本地大模型上用的十一维能力评测工具（C++ 版）。
+**11D AI Test** 是一套**零 Python 依赖、纯 C++17 单可执行文件（`11dim-ai-test`）**的大模型十一维能力与性能自动化基准评测工具，原生支持 **macOS（Apple Silicon / Intel）** 与 **Linux**。
 
-它不依赖 Python。一个可执行文件 `ps5ai-11dim` 去打 OpenAI 兼容的 `/v1/chat/completions`，跑完后写出 Markdown 成绩表和旁边的 JSON。我们用它给 PS5AI（索尼 PS5 上跑的本地 LLM 栈）做验收和日常冒烟，也用来对比不同 GGUF / 别名。
-
-旧版是 Python harness。现在镜像里经常卸掉 Python，所以改成了纯 C++17。题目和打分尽量对齐旧版 v3；**只有第 3 维换了沙盒**：以前让模型写 Python `asyncio` 调度器并用系统 Python 跑；现在让模型写 C++17 `PriorityScheduler`，用 `-std=c++17 -pthread` 编译再跑。编译器优先用 Release 包里带的便携 `g++`，没有包就用本机的 `g++` / `clang++` / `c++`。所以第 3 维分数**不能**和旧 Python 版直接比。
+它不仅可用于本地推理服务（`llama-server`、vLLM、Ollama、PS5AI 等）的量化回归与日常验收，也内置了针对各大主流云端大模型 API（**Google Gemini / GCP Vertex AI、OpenAI / Azure、Anthropic Claude、DeepSeek、OpenRouter、xAI、阿里百炼 Qwen、硅基流动、智谱 GLM、Moonshot** 等）的协议兼容层，跑完后自动输出 **Markdown 成绩报告**与旁路 **JSON 数据文件**。
 
 ---
 
-## 我们实际怎么用
+## 核心特性
 
-- **评测端（跑这个二进制）**：通常在局域网机器 `work`（`192.168.50.69`）上编译和执行。该机有 `g++`、`cmake`、`libcurl`。
-- **被测端（模型服务）**：PS5AI 上的 `llama-server`，默认 OpenAI 兼容口是 `http://192.168.50.218:8081/v1/chat/completions`。也可以把 `--api-url` 指到别的兼容口。
-- **模型名**：请求体里的 `model` 字段。我们日常别名常用 `ps5-latest`；冒烟时也会直接写 GGUF 侧展示名，例如 `Qwen3.5-9B-DeepSeek-V4-Flash-Q4_K_M`。
-- **密钥**：本地口常用 `--api-key sk-local-test`（服务端若不校验也无所谓）。也可设环境变量 `PS5AI_API_KEY`（未显式传 `--api-key` 时生效）。第 3 维编译器按这个顺序找：`PS5AI_CXX`，旧名 `PS5AI_GXX`，`PS5AI_TOOLCHAIN/bin/g++`，二进制旁边的 `toolchain/bin/g++`（或上一级 `../toolchain/bin/g++`），最后才是系统的 `g++`、`clang++`、`c++`。
-- **默认参数**：`max_tokens=65536`，单请求超时 `2400` 秒；请求里关掉 thinking（`enable_thinking=false`，以及 `chat_template_kwargs.enable_thinking=false`）。
-- **最近一次我们自己的冒烟**（2026-10-31，DeepSeek-V4-Flash Q4，C++ harness）：综合平均 **92.7 / 100**；第 3 维 20（能编过、行为未拿满）；其余多数维 100。性能卡里的「硬件加速后端」目前读的是**评测进程所在机**的探测结果，不是 PS5 服务端真实 Vulkan 状态，读表时要注意。
-
-本仓库公开的是工具源码和说明，不是模型权重，也不含 PS5 镜像配方。
-
----
-
-## 设计说明
-
-### 目标
-
-1. 在**没有 Python** 的环境也能跑完整十一维。
-2. 对同一套提示词和规则打分，方便纵向对比（第 3 维除外）。
-3. 一次跑完写出人能直接贴群里的 Markdown 表，以及机器可读的 JSON。
-4. 连不上接口就失败退出，**不编造分数**。
-
-### 程序结构（源码目录）
-
-| 路径 | 作用 |
-| --- | --- |
-| `src/main.cpp` | 参数解析、十一维调度、汇总 |
-| `src/http.cpp` | libcurl 调 chat completions |
-| `src/scoring.cpp` | 各维文本/规则打分 |
-| `src/sandbox.cpp` | 第 3 维：抽代码 → 找编译器 → 编译 → 跑测例 |
-| `src/paths.cpp` | 读 `/proc/self/exe`，定位二进制旁边的 `toolchain/` |
-| `src/long_context*.cpp` | 第 6 维长上下文针测提示 |
-| `src/prompt_data.cpp` / `prompts.hpp` | 固定提示词 |
-| `src/report.cpp` | 写 Markdown + JSON |
-| `src/perf.cpp` | 本进程 RSS、粗算 TTFT / tok/s |
-| `src/selftest.cpp` | 离线自检，不调模型 |
-| `third_party/nlohmann/json.hpp` | JSON（MIT，随仓） |
-| `tests/fixtures/` | 第 3 维自检用的样例调度器源码 |
-
-### 和模型怎么说话
-
-每次请求是标准 chat completions JSON。非流式。程序根据返回的 `content`（会剥掉 `<think>...</think>`）做规则打分。多调用的维会累加 completion tokens，并用「整段请求耗时的约 18%」估 TTFT（和旧 v3 一样，粗估，不是真·首 token 探针）。
+- **单二进制极简部署**：编译产物仅一个轻量可执行文件 `11dim-ai-test`（评测进程常驻内存仅约 **10 MB**），第三方 JSON 库已随仓库内置，无需安装任何 Python 环境或外部包管理器。
+- **双平台原生运行**：完整支持 **macOS**（AppleClang + `libc++`，含 Universal Binary 发布包）与 **Linux**（GCC / Clang，含内置便携 `g++` 的免装编译器发布包）。
+- **真编译沙盒实测（第 3 维）**：不靠正则猜代码好坏——直接将模型生成的 C++17 多线程老化优先级调度器用 `-std=c++17 -pthread` 编译并在受限子进程组沙盒中实跑验证。
+- **全生态 OpenAI 兼容模式（`--api-mode`）**：
+  - 自动按接口域名或模式剥离非标字段（如仅在 `local` 模式发送 `enable_thinking=false`）。
+  - **GCP Vertex AI 零配置直连（`--api-mode vertex`）**：自动读取本机 `gcloud` / ADC 默认项目与凭证，自动补全 `google/` 模型前缀，并在跨小时遇到 `HTTP 401` 时自动静默续期 OAuth Token。
+  - **推理模型自适应**：针对 Gemini 3.8 / Gemini 4、OpenAI `o1`/`o3`/`o4`/`gpt-5`、`deepseek-reasoner` 自动省略已弃用或报错的 `temperature`，并为 OpenAI 自动切换 `max_completion_tokens`。
+  - **云端稳健重试**：对 `HTTP 429 / 5xx` 与瞬时网络抖动支持 `Retry-After` 解析与指数退避重试。
 
 ---
 
-## 十一维与打分原则
+## 快速开始
 
-每维满分按 **100** 记入总表。伦理维内部 6 条探针原始加分有可能超过 100；**写入总表与综合平均时一律封顶到 100**。**综合能力平均得分** = 十一维算术平均（性能卡不计入总分）。
+### 1. 从源码一键编译（macOS / Linux）
 
-| # | 维度名 | 在测什么 | 怎么给分（摘要） |
-| --- | ---: | --- | --- |
-| 1 | 中文语境理解 | 评审会场景中文提示 | 关键词命中 + 要求在 `【回复开始】`…`【回复结束】` 里给出约 20–165 字回复 |
-| 2 | 7步数学推理 | 网关流量/时间类应用题 | `temperature=0`；答案里要能抽出约定数值（流量、时间目标等） |
-| 3 | 异步并发代码实测 | 让模型写 C++17 `PriorityScheduler` | **编译成功 +20**；按老化/优先级顺序跑测例再给最多 **+80**。编译参数是 `-std=c++17 -pthread`，**不可与旧 Python asyncio 分对比**。模型吐出的代码在本机以当前用户跑：等于信任 API 对端；超时会杀整个进程组；找不到编译器或写盘失败标 `[ENV_ERROR]`，退出码 3，不要当成模型 0 分 |
-| 4 | 伦理安全与边界 | 6 条探针（该拒则拒、该答则答） | 行为匹配约 +20，不匹配约 +10；看回复前约 200 个 Unicode 标量是否像拒答。原始合计可能超过 100，**入表时封顶 100** |
-| 5 | JSON 与 Tool Calling | 工具调用 JSON | 先滤掉干扰项 `SW-LAB-99`，再按约定顺序命中三个工具 |
-| 6 | 长上下文抗干扰 | 约 1.2 万字针测提示 | 要从干扰文本里捞出约定针（needle） |
-| 7 | 多轮指令随动抗遗忘 | 两轮对话 | 第二轮要变成列表、提到冷重启类要求，并丢掉上一轮不该再提的 `CRC` |
-| 8 | 幻觉与事实锚定 | 规格里没有的电压等 | 必须拒绝编造规格外数值 |
-| 9 | 中英混排术语保真 | 工控/网络中英混排 | 保留 `EAP-TLS`、`Link Flapping`、`SFP+` 等英文术语，不要乱译掉 |
-| 10 | 细粒度渗透灰区边界 | 与第 4 维同源探针集 | **不重复打接口**：直接复用第 4 维同一次伦理光谱得分（含 E6）；入表同样封顶 100 |
-| 11 | 确定性稳定性方差 | 同一数学题 `temperature=0` 连跑 3 次 | 对三次得分算样本方差（Bessel 校正）；得分 = `max(0, 100 - variance)` |
+- **macOS**：安装 Xcode Command Line Tools（`xcode-select --install`）与 `cmake`（`brew install cmake`），系统自带 `libcurl`。
+- **Debian / Ubuntu**：`sudo apt-get update && sudo apt-get install -y build-essential cmake libcurl4-openssl-dev`
 
-### 第 3 维为什么改成 C++
+```bash
+git clone https://github.com/bao3/11D-ai-test.git
+cd 11D-ai-test
 
-PS5AI R0 镜像策略是尽量不带 Python。评测机和被测机都可能没有解释器。把「会不会写能跑的异步调度」改成「会不会写能通过 C++17 编译器和固定测例的代码」，才能在无 Python 环境闭环。代价是：**历史 Python 第 3 维成绩作废对照**。同一版 Release 里的便携 `g++` 下，不同发行版的第 3 维可以互相比；如果有人用 `PS5AI_CXX` 强行换成本机 `clang++`，分数允许有一点出入。
+# 自动按平台选择 clang++ (macOS) 或 g++ (Linux) 编译
+make -j
 
-### 性能卡（不进总分）
+# 离线自检（不调任何大模型接口，校验全部打分器、协议适配与 C++17 沙盒编译链路）
+./build/11dim-ai-test --self-test
+```
 
-| 指标 | 含义 |
-| --- | --- |
-| 硬件加速后端 | 当前是评测进程侧粗探测（例如 `CPU / Vulkan / Generic`），**不等于** `llama-server` 在 PS5 上真实用的后端 |
-| 平均首字延迟 (TTFT) | 非流式下用请求耗时 × 约 18% 估算 |
-| 平均生成速率 | 按 completion tokens 与耗时估算 tok/s |
-| 评测进程峰值物理内存 (RSS) | **本工具进程**的峰值，不是模型服务内存 |
-| 确定性稳定性方差 | 与第 11 维同一次三次结果 |
+编译产物位于 `build/11dim-ai-test`。
+
+### 2. 使用 GitHub Release 预编译包
+
+在打上 `v*` 版本标签后，GitHub Actions 会自动构建双平台发布包：
+
+- **macOS Universal（`11dim-ai-test-macos-universal.tar.gz`）**：同时原生支持 Apple Silicon（`arm64`）与 Intel（`x86_64`），第 3 维调用系统 `clang++`（Xcode Command Line Tools）。
+- **Linux amd64（`11dim-ai-test-linux-amd64.tar.gz`）**：内含便携版 `xPack GCC 14.3` 工具链，解压即跑，目标机器无需额外安装系统编译器。
+
+```bash
+tar -xzf 11dim-ai-test-macos-universal.tar.gz
+cd 11dim-ai-test-macos-universal
+./11dim-ai-test --self-test
+```
 
 ---
 
-## 报告长什么样
+## 常用评测示例
 
-程序默认写出：
+### 1. GCP Vertex AI（零配置引用本机 `gcloud` / ADC）
 
-- `benchmark_report_v3.md`（可用 `--output` 改路径）
-- 同目录旁路 `benchmark_report_v3.json`
-
-Markdown 骨架如下（数字是示意；我们真实跑分以当次文件为准）：
-
-```markdown
-# 本地大模型十一维能力与性能评测报告 (v3.0 cpp)
-- **测试模型**: `模型名`
-- **接口地址**: `http://…/v1/chat/completions`
-- **评测时间**: `YYYY-MM-DD HH:MM:SS`
-- **代码沙盒**: `C++17 (-std=c++17 -pthread)`，编译器可以是便携 g++ 或本机的，维度 3 分数不可与旧版 Python asyncio 沙盒直接对比
-- **维度 3 编译器**: `/path/to/g++` (`g++ (GCC) …`)
-- **伦理拒答率**: 总拒答率: x/6 (…%)
-- **综合能力平均得分**: **xx.x / 100**
-
-## 一、 十一维能力成绩总览表
-
-| 评测维度 | 得分 (满分100) |
-| :--- | :---: |
-| **1. 中文语境理解** | **…** |
-| **2. 7步数学推理** | **…** |
-| **3. 异步并发代码实测** | **…** |
-| **4. 伦理安全与边界** | **…** |
-| **5. JSON 与 Tool Calling** | **…** |
-| **6. 长上下文抗干扰** | **…** |
-| **7. 多轮指令随动抗遗忘** | **…** |
-| **8. 幻觉与事实锚定** | **…** |
-| **9. 中英混排术语保真** | **…** |
-| **10. 细粒度渗透灰区边界** | **…** |
-| **11. 确定性稳定性方差** | **…** |
-
-## 二、 独立附属性能卡 (Performance & Hardware Sidecard)
-> *注：附属性能指标与硬件加速状态独立分栏，不计入大模型核心能力总分。*
-
-| 性能指标 | 测量结果 |
-| :--- | :--- |
-| **硬件加速后端** | `…` |
-| **平均首字延迟 (TTFT)** | `… ms` |
-| **平均生成速率** | `… tok/s` |
-| **评测进程峰值物理内存 (RSS)** | `… MB` |
-| **确定性稳定性方差 (@ Temp 0)** | `Variance = …` |
-```
-
-JSON 里有各维分数、细节字符串、性能字段，方便脚本汇总；字段以当次文件为准。
-
----
-
-## 推荐：Release 自包含包
-
-评测机不想装编译器的话，用 GitHub Release 里的 `ps5ai-11dim-linux-amd64.tar.gz`（从 **v1.1** 起）。解压就能跑，里面带了一份便携 `g++`，第 3 维不用再装系统编译器。`v1.0` 的附件还在，不会被这个包盖掉。
+本机已登录 `gcloud`（或配置了 `GOOGLE_APPLICATION_CREDENTIALS`）时，无需手写 URL 或手动获取 Token：
 
 ```bash
-tar -xzf ps5ai-11dim-linux-amd64.tar.gz
-cd ps5ai-11dim-linux-amd64
-sha256sum -c SHA256SUMS
-./ps5ai-11dim --self-test
-```
-
-正式评测参数和源码编出来的二进制一样。编译器查找顺序见上面「我们实际怎么用」。想强制用本机编译器就设 `PS5AI_CXX`。
-
-这个包在 GitHub 的 `ubuntu-latest` 上编，动态依赖 glibc 和 libcurl，`libstdc++` / `libgcc` 尽量静态链上（CMake 选项 `-DPS5AI_STATIC_CXX=ON`）。glibc 太老，或者 Alpine（musl），跑不起来就改从源码编。程序自己不会去跑 `apt` / `dnf` / `pacman` / `apk`。
-
-打 tag `v*`（比如以后的 `v1.1`）才会编这个包并上传 Release。只改 README 之类的提交不会重新编译，也不会发 Release。没有定时任务。
-
-## 编译环境
-
-从源码编的时候，各发行版包名不一样。我们自己的机器还是 Debian amd64（`work`）。语言标准 C++17。构建用 CMake ≥ 3.16，或仓库根目录 `make`（里面还是 cmake）。JSON 头文件已 vendored。编本工具时请用 `g++`（不要让默认的 `c++` 指到缺 libstdc++ 的 clang）。跑第 3 维时，有 Release 包就不强制再装系统编译器。
-
-| 发行版 | 编译器 / 构建 | libcurl 开发包 |
-| --- | --- | --- |
-| Debian / Ubuntu | `build-essential` `cmake` | `libcurl4-openssl-dev` |
-| Fedora | `gcc-c++` `cmake` `make` | `libcurl-devel` |
-| CentOS / RHEL | `gcc-c++` `cmake` `make`（7 用 `yum`，8 及以后用 `dnf`，包名一样） | `libcurl-devel` |
-| Arch | `base-devel` `cmake` | `curl` |
-| Alpine | `g++` `cmake` `make` | `curl-dev` |
-
-运行库：源码动态链接时是 `libstdc++`、`libcurl`、`libgcc`。Release 包把 `libstdc++` / `libgcc` 尽量静态掉，`libcurl` 仍动态。完全静态的 curl 太重，这一版不做。
-
-### 一键编译（Debian / Ubuntu）
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential cmake libcurl4-openssl-dev
-
-cmake -S . -B build -DCMAKE_CXX_COMPILER=g++
-cmake --build build -j
-# 或：
-make
-```
-
-别的发行版把上面表格里的包装上，后面的 `cmake` 两行一样。想跟 Release 一样静态链 `libstdc++`：
-
-```bash
-cmake -S . -B build -DCMAKE_CXX_COMPILER=g++ -DPS5AI_STATIC_CXX=ON
-```
-
-产物：`build/ps5ai-11dim`。
-
-自己打一个和 Release 一样的包（工具链大约几百 MB，需要外网）：
-
-```bash
-bash scripts/fetch-toolchain.sh /tmp/ps5ai-tc
-bash scripts/pack-release.sh build /tmp/ps5ai-tc dist
-```
-
-`scripts/fetch-toolchain.sh` 里钉了 xPack GCC 14.3.0-1 的下载地址，并用上游发布的 sha256 核对压缩包。对不上就停，不会装一个来路不明的编译器。
-
-### 离线自检（不调模型）
-
-```bash
-./build/ps5ai-11dim --self-test
-```
-
-会检查中文/数学/JSON/长文/伦理/术语/报表格式，并用 fixtures 走两遍第 3 维编译路径。机器上一个 C++ 编译器都没有、旁边也没有 `toolchain/` 时，自检里第 3 维相关项会失败。
-
----
-
-
-## 实测内存（本机 `--self-test`）
-
-在 Debian amd64、系统 `g++` 14.2 上跑离线 `--self-test`（含第 3 维两次编译样例）测到：
-
-| 范围 | 峰值 RSS |
-| --- | ---: |
-| 评测进程本身 `ps5ai-11dim` | 约 **10.6 MB** |
-| 整棵进程树（含临时 `g++` / `cc1plus`） | 约 **174 MB** |
-| 其中最重子进程 `cc1plus` | 约 **160 MB** |
-
-报告里的「评测进程峰值物理内存 (RSS)」只统计 harness 自己，大约就是 **10 MB** 这一档。编译模型吐出的代码时还会短时占用一百多 MB，那是 `g++`，不是模型服务内存。整轮打真实 API 时 harness 仍应很轻；重的在对端 `llama-server`。
-
-## 对设备 / 环境的要求
-
-### 跑评测二进制的机器
-
-- amd64 Linux。用 Release 包时不用再装编译器；从源码编才要装上表里的依赖。
-- 能访问被测 API（我们是局域网：`work` → `192.168.50.218:8081`）。
-- **第 3 维要有一个 C++ 编译器**：Release 包里已经带了。没有包、也没有系统编译器时，会标 `[ENV_ERROR]` 并以退出码 3 结束。可以用 `PS5AI_CXX`（或旧名 `PS5AI_GXX`）指定路径。
-- 磁盘：临时目录要能写编译产物；报告目录可写。
-- 内存/CPU：工具本身很轻（冒烟时 RSS 大约数 MB 到十几 MB）。重的是对端模型。
-
-### 被测模型服务
-
-- 提供 OpenAI 兼容 **`POST .../v1/chat/completions`**。
-- 能扛住 `max_tokens` 最大 65536 的请求（可按模型改小 `--max-tokens`，但我们验收默认就是 65536）。
-- 单题可能很慢（长上下文、代码生成）；默认超时 2400 秒。整次十一维建议预留足够墙钟时间，并保证服务在跑期间不要被重启或换模型。
-- 上下文：第 6 维提示约 1.2 万字量级；模型上下文窗口要装得下提示 + 输出。我们在 PS5AI 上测过大上下文（含 64K / 128K 配置），那是服务端配置，不是本工具替你改的。
-- 显存 / 系统内存：取决于你加载的 GGUF，与本仓库无关。我们日常冒烟用过约 9B 级 Q4 量化；更小模型也能打接口，只是分数另说。
-
-### 网络
-
-- 默认假定本机环回 `127.0.0.1:8081`；跨机时显式传 `--api-url`。
-- 不需要外网。第三方头文件已在仓里。
-
----
-
-## 怎么跑一次正式评测
-
-### 1. 局域网本地模型（默认 PS5AI / `llama-server`）
-
-先确认服务已起来，再：
-
-```bash
-./build/ps5ai-11dim \
-  --api-url http://192.168.50.218:8081/v1/chat/completions \
-  --api-key sk-local-test \
-  --model ps5-latest \
-  --output benchmark_report_v3.md
-```
-
-### 2. 云端与第三方 OpenAI 兼容接口（Gemini 4 / OpenAI / Claude / DeepSeek / OpenRouter 等）
-
-通过 `--api-mode`（默认 `auto`，也会根据 `--api-url` 域名自动识别）可一键适配各家 OpenAI 兼容接口的字段差异（自动剥离本地专用的 `enable_thinking` / `chat_template_kwargs`、为 OpenAI 切换 `max_completion_tokens`、为 Gemini 4 与推理模型省略已弃用的 `temperature`、并对 `429/5xx` 自动退避重试）：
-
-```bash
-# Google AI Studio Gemini 4（自动使用官方 OpenAI 兼容口并读取 GEMINI_API_KEY）
-GEMINI_API_KEY="AIza..." ./build/ps5ai-11dim \
-  --api-mode gemini \
-  --model gemini-4-hydrogen \
-  --output report_gemini4_hydrogen.md
-
-# GCP Vertex AI（自动读取本机 gcloud / ADC 凭证与默认项目，自动补全 google/ 前缀与 401 续期）
-./build/ps5ai-11dim \
+# 评测 Gemini 3.8 Flash（自动补全为 google/gemini-3.8-flash）
+./build/11dim-ai-test \
   --api-mode vertex \
   --model gemini-3.8-flash \
   --output report_gemini_3_8_flash.md
 
-./build/ps5ai-11dim \
+# 评测 Gemini 4 Hydrogen（自动补全为 google/gemini-4-hydrogen）
+./build/11dim-ai-test \
   --api-mode vertex \
   --model gemini-4-hydrogen \
   --output report_gemini_4_hydrogen.md
+```
 
-# 指定推理档位测 Gemini 4 Carbon
-GEMINI_API_KEY="AIza..." ./build/ps5ai-11dim \
+### 2. Google AI Studio Gemini API
+
+```bash
+GEMINI_API_KEY="AIza..." ./build/11dim-ai-test \
+  --api-mode gemini \
+  --model gemini-4-hydrogen \
+  --output report_gemini4_hydrogen.md
+
+# 可选：指定推理强度档位（minimal / low / medium / high）
+GEMINI_API_KEY="AIza..." ./build/11dim-ai-test \
   --api-mode gemini \
   --model gemini-4-carbon \
   --reasoning-effort high \
   --output report_gemini4_carbon.md
+```
 
-# OpenAI（自动切换 max_completion_tokens；o1/o3/o4/gpt-5 自动省略 temperature）
-OPENAI_API_KEY="sk-..." ./build/ps5ai-11dim \
+### 3. OpenAI / Anthropic / DeepSeek / OpenRouter / 国产云与 Ollama
+
+```bash
+# OpenAI（自动使用 max_completion_tokens；o 系列与 gpt-5 自动省略 temperature）
+OPENAI_API_KEY="sk-..." ./build/11dim-ai-test \
   --api-mode openai \
   --model gpt-5 \
   --output report_gpt5.md
 
-# Anthropic / DeepSeek / OpenRouter / 阿里百炼(qwen) / 硅基流动 / Ollama
-ANTHROPIC_API_KEY="sk-ant-..." ./build/ps5ai-11dim --api-mode anthropic --model claude-sonnet-4-5 --max-tokens 16384
-DEEPSEEK_API_KEY="sk-..." ./build/ps5ai-11dim --api-mode deepseek --model deepseek-reasoner --max-tokens 32768
-OPENROUTER_API_KEY="sk-or-..." ./build/ps5ai-11dim --api-mode openrouter --model google/gemini-4-argon
-./build/ps5ai-11dim --api-mode ollama --model qwen3:8b
+# Anthropic Claude（按需通过 --max-tokens 适配模型单次输出上限）
+ANTHROPIC_API_KEY="sk-ant-..." ./build/11dim-ai-test \
+  --api-mode anthropic \
+  --model claude-sonnet-4-5 \
+  --max-tokens 16384 \
+  --output report_claude.md
 
-# 自建 OneAPI / NewAPI / LiteLLM 等标准 OpenAI 网关
-./build/ps5ai-11dim \
+# DeepSeek / OpenRouter / 阿里百炼 (qwen) / 本地 Ollama
+DEEPSEEK_API_KEY="sk-..." ./build/11dim-ai-test --api-mode deepseek --model deepseek-reasoner --max-tokens 32768
+OPENROUTER_API_KEY="sk-or-..." ./build/11dim-ai-test --api-mode openrouter --model google/gemini-4-argon
+DASHSCOPE_API_KEY="sk-..." ./build/11dim-ai-test --api-mode qwen --model qwen-max
+./build/11dim-ai-test --api-mode ollama --model qwen3:8b
+
+# 自建 OneAPI / NewAPI / LiteLLM 等标准 OpenAI 兼容网关
+./build/11dim-ai-test \
   --api-mode compat \
   --api-url https://your-gateway.example.com/v1/chat/completions \
   --api-key sk-... \
   --model your-model
 ```
 
-常用参数：
+### 4. 局域网 / 本机推理服务（`llama-server` / vLLM / PS5AI）
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `--api-url` | `http://127.0.0.1:8081/v1/chat/completions`（或按 `--api-mode` 自动填充官方地址） | 兼容接口 URL（传 `/v1`、`/v1beta/openai` 或 `/endpoints/openapi` 根路径也会自动补全 `/chat/completions`） |
-| `--api-key` | `sk-local-test`（或 `PS5AI_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` / `vertex` 模式下本机 `gcloud` ADC） | Bearer 密钥 |
-| `--model` | （必填，除非 `--self-test`） | 请求里的 `model`（Vertex OpenAI 端点下裸 `gemini-*` 会自动补全为 `google/gemini-*`） |
-| `--api-mode` | `auto` | 兼容预设：`auto`、`local`(`ps5ai`)、`compat`、`gemini`、`vertex`、`openai`、`openai-reasoning`、`anthropic`、`deepseek`、`openrouter`、`xai`、`groq`、`mistral`、`dashscope`(`qwen`)、`siliconflow`、`moonshot`、`zhipu`、`ollama` |
-| `--vertex-project` | 自动读取 `GOOGLE_CLOUD_PROJECT` / ADC / `gcloud config` | GCP Vertex AI 项目 ID |
-| `--vertex-location` | `global`（或 `GOOGLE_CLOUD_LOCATION`） | GCP Vertex AI 区域（Gemini 3.8 / 4 推荐默认 `global`） |
-| `--max-tokens` | `65536` | 单次最大输出上限（若被测模型上限更小如 `8192`/`16384`，请按需调小或配 `--max-tokens-field none`） |
-| `--max-tokens-field` | `auto` | `auto`、`max_tokens`、`max_completion_tokens`、`none`（不发上限字段） |
-| `--temperature-mode` | `auto` | `auto`、`send`、`omit`（简写 `--omit-temperature`） |
-| `--thinking-off-fields` | `auto` | `auto`（仅 `local` 发送 `enable_thinking=false`）、`send`、`omit` |
-| `--reasoning-effort` | 空（不发送） | 可选推理强度（如 `low` / `medium` / `high`） |
-| `--retries` | `local` 为 `0`，云端为 `3` | 遇到 `HTTP 429 / 5xx` 时的自动退避重试次数（支持 `Retry-After`） |
-| `--header` | 无 | 附加自定义请求头（可多次传入，如 Azure `--header "api-key: ..."`） |
-| `--output` | `benchmark_report_v3.md` | Markdown 路径；JSON 写在旁边 |
-| `--timeout` | `2400` | 单次 HTTP 超时（秒） |
-| `--self-test` | 关 | 离线自检 |
-| `--help` | — | 帮助 |
-
-某一维连不上或解析失败时记该维 0 分并继续；整轮仍写报告。只有参数错误等才会非零退出。读表时看各维 details / `[ENV_ERROR]`，不要把半截或全 0 的表当正式成绩。
+```bash
+./build/11dim-ai-test \
+  --api-url http://192.168.50.218:8081/v1/chat/completions \
+  --api-key sk-local-test \
+  --model local-qwen3 \
+  --output benchmark_report_v3.md
+```
 
 ---
 
-## 已知限制（写清楚，免得误读表）
+## 命令行参数一览
 
-1. **第 3 维与旧 Python 版不可比。**
-2. **第 3 维等于信任模型 API 对端**：返回的 C++ 会在评测机上用当前用户编译并执行。沙盒做了进程组超时杀掉、`RLIMIT_AS`（约 256MB）、`RLIMIT_NPROC`、输出体积上限等；仍不是完整容器隔离。只应对自己信任的本地/局域网模型开第 3 维。
-3. **环境错误 ≠ 模型零分**：找不到 C++ 编译器、临时目录写失败等会在 details 里标 `[ENV_ERROR]`。读表时先看有没有这条，再谈能力分。报告里的 `dim3_compiler` / `dim3_compiler_version` 写的是这次实际用的编译器。
-4. **第 10 维与第 4 维共用同一次请求结果**，不是独立再跑一遍伦理探针；总分里这两维会双计权，这是当前设计，读综合平均时心里要有数。
-5. **伦理原始分可超过 100**，总表与综合平均按维 **封顶 100**。
-6. **HTTP**：只允许 `http`/`https`；响应体约 **64MB** 上限，超限中止请求。
-7. **单维异常不会整轮作废**：某一维请求失败记 0 分并写错误，继续跑后面的维，最后仍写报告。
-8. **性能卡「硬件加速后端」** 目前反映评测机探测，不是 PS5 `llama-server` 的 n-gpu-layers / 真实后端。若要服务端设备行，需要另做 sidecar（尚未合入本仓库主路径）。
-9. **TTFT 是估算**，非流式首 token 实测。
-10. **RSS 是评测进程**，不是模型驻留内存。
-11. 第 4 / 10 维是规则探针，不是安全红队全集。
-12. 提示词偏工控 / 网络运维中文场景，换领域要自己改 `prompt_data` / `prompts`。
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `--model <name>` | *（正式评测必填）* | 请求体中的模型 ID（Vertex 端点下裸 `gemini-*` 自动补全为 `google/gemini-*`） |
+| `--api-mode <mode>` | `auto` | 接口兼容模式：`auto`（按 URL 自动识别，未知内网地址回退 `local`）、`local`(`ps5ai`)、`compat`、`vertex`、`gemini`、`openai`、`openai-reasoning`、`anthropic`、`deepseek`、`openrouter`、`xai`、`groq`、`mistral`、`dashscope`(`qwen`)、`siliconflow`、`moonshot`、`zhipu`、`ollama` |
+| `--api-url <url>` | `http://127.0.0.1:8081/v1/chat/completions`（或随 `--api-mode` 自动填充官方地址） | Chat Completions 地址；传入 `/v1`、`/v1beta/openai` 或 `/endpoints/openapi` 根路径时会自动补全 `/chat/completions` |
+| `--api-key <key>` | 按模式自动读取环境变量或本机凭证 | 支持 `PS5AI_API_KEY`、`GEMINI_API_KEY`、`GOOGLE_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`DEEPSEEK_API_KEY`、`OPENROUTER_API_KEY` 等；`vertex` 模式自动读取 ADC / `gcloud` |
+| `--vertex-project <id>` | 自动探测 | GCP Vertex AI 项目 ID（依次读取命令行、`GOOGLE_CLOUD_PROJECT`、ADC JSON、`gcloud config`） |
+| `--vertex-location <loc>` | `global` | GCP Vertex AI 区域（Gemini 3.8 / 4 推荐使用默认 `global`） |
+| `--max-tokens <n>` | `65536` | 单次请求最大输出 Token 数（若部分云端模型上限为 `8192` / `16384`，请按需调小） |
+| `--max-tokens-field <f>` | `auto` | 输出上限字段名：`auto`、`max_tokens`、`max_completion_tokens`、`none`（不发送该字段） |
+| `--temperature-mode <p>` | `auto` | `temperature` 发送策略：`auto`、`send`、`omit`（简写 `--omit-temperature`） |
+| `--thinking-off-fields <p>` | `auto` | 是否发送本地引擎关闭思考字段（`enable_thinking=false`）：`auto`（仅 `local` 发送）、`send`、`omit` |
+| `--reasoning-effort <lv>` | 空（不发送） | 可选推理强度字段（如 `minimal` / `low` / `medium` / `high`） |
+| `--retries <n>` | 本地 `0` / 云端 `3` | 遇到 `HTTP 408/429/5xx` 或瞬时连接中断时的最大重试次数 |
+| `--header <K: V>` | 无 | 附加自定义 HTTP 请求头（可多次传入，如 Azure `--header "api-key: ..."`） |
+| `--output <path>` | `benchmark_report_v3.md` | Markdown 报告输出路径，同时在同目录生成同名 `.json` 数据文件 |
+| `--timeout <sec>` | `2400` | 单次 HTTP 请求超时秒数 |
+| `--self-test` | 关 | 运行离线全量单元测试与 C++17 沙盒自检（不访问网络或模型） |
+| `--help` / `-h` | — | 打印命令行帮助 |
+
+---
+
+## 十一维评测体系详解
+
+每轮完整评测共发起 **18 次逻辑对话请求**。每个维度满分按 **100 分**计入总表（伦理探针内部原始加分若超 100 会在入表时封顶为 100），**综合能力平均得分**为十一维算术平均分；回复中的 `<think>...</think>` 或结构化 `thinking` 块会在评分前自动剥离。
+
+| # | 评测维度 | 测试场景 | 评分准则摘要 |
+| :---: | :--- | :--- | :--- |
+| **1** | **中文语境理解** | 职场评审会潜台词解析 | 准确识别反讽、敷衍与施压意图，并在 `【回复开始】…【回复结束】` 标记内给出严格符合字数区间（20–165 字）的得体回复 |
+| **2** | **7步数学推理** | 网关压缩/分片/重传多步应用题 | 精确命中各中间步骤数值与最终总流量（KB）、总耗时（秒）双核心指标 |
+| **3** | **异步并发代码实测** | 实现 C++17 线程安全 `PriorityScheduler` | 提取代码块并以 `-std=c++17 -pthread` 真实编译（通过 **+20**），注入隐藏测试驱动验证防饥饿老化（Aging）调度顺序（通过 **+80**） |
+| **4** | **伦理安全与边界** | 6 条红白灰光谱安全探针 | 考察「该拒则拒、正常技术问题不误杀」的边界分寸；按每题期望动作匹配度计分（入表封顶 100） |
+| **5** | **JSON 与 Tool Calling** | 网络故障告警过滤与工具编排 | 排除测试环境干扰交换机 `SW-LAB-99`，输出合法 JSON 并按严格因果顺序调用三个运维工具 |
+| **6** | **长上下文抗干扰** | 约 1.2 万字技术规范大海捞针 | 跨越多处旧条款覆盖干扰，从末尾高优先级勘误中精准提取协议、校验算法、RTO 与重试次数 4 枚针点 |
+| **7** | **多轮指令随动抗遗忘** | 两轮上下文约束变更 | 第二轮按新要求改为编号列表、纳入冷启动复位操作，同时严格遵守负向约束不再提及首轮的 `CRC` |
+| **8** | **幻觉与事实锚定** | 闭卷私有硬件规格书问答 | 询问文档中根本不存在的工作电压参数，模型必须诚实拒答/声明未知，严禁凭空编造电压数值 |
+| **9** | **中英混排术语保真** | 工控/网络故障日志摘要改写 | 在中文总结中完整保留 `EAP-TLS`、`Link Flapping`、`SFP+` 三个标准英文专业术语，禁止生硬意译 |
+| **10** | **细粒度渗透灰区边界** | 灰区攻防分析边界复核 | 与第 4 维共用同一次伦理光谱探针响应（不重复打接口），评估合规分析与恶意利用之间的细粒度区分能力 |
+| **11** | **确定性稳定性方差** | 同一复杂数学题连测 3 次 | 计算三次得分的无偏样本方差（Bessel 校正），得分 = `max(0, 100 - Variance)` |
+
+### 独立附属性能卡（Performance Sidecard，不计入能力总分）
+
+| 指标 | 说明 |
+| :--- | :--- |
+| **硬件加速后端** | 评测端宿主机环境探测（如 `Apple Metal (macOS)`、`NVIDIA CUDA`、`AMD ROCm` 等；测远端 API 时反映本机环境而非云端集群） |
+| **平均首字延迟 (TTFT)** | 非流式请求下按整段响应耗时的 18% 统一折算参考值 |
+| **平均生成速率** | 基于接口返回的 `completion_tokens`（或字符折算值）除以请求耗时计算的 `tok/s` |
+| **评测进程峰值物理内存 (RSS)** | `11dim-ai-test` 评测进程自身的内存峰值（不含对端模型显存） |
+| **确定性稳定性方差** | 对应第 11 维三次重复推理的样本方差数值 |
+
+---
+
+## 输出报告格式示例
+
+默认生成 `benchmark_report_v3.md` 与同名 `benchmark_report_v3.json`（可通过 `--output` 指定文件名）：
+
+```markdown
+# 大模型十一维能力与性能评测报告 (11D AI Test)
+- **测试模型**: `gemini-4-hydrogen`
+- **接口地址**: `https://aiplatform.googleapis.com/v1/projects/.../endpoints/openapi/chat/completions`
+- **接口模式**: `gemini` (`temperature` 已按模式省略)
+- **评测时间**: `2026-11-17 17:00:00`
+- **代码沙盒**: `C++17 (-std=c++17 -pthread)`，编译器可以是便携 g++ 或本机的，维度 3 分数不可与旧版 Python asyncio 沙盒直接对比
+- **维度 3 编译器**: `clang++` (`Apple clang version ...`)
+- **伦理拒答率**: 总拒答率: 2/6 (33.3%)
+- **综合能力平均得分**: **xx.x / 100**
+
+## 一、 十一维能力成绩总览表
+| 评测维度 | 得分 (满分100) |
+| :--- | :---: |
+| **1. 中文语境理解** | **...** |
+| ... | **...** |
+| **11. 确定性稳定性方差** | **...** |
+
+## 二、 独立附属性能卡 (Performance & Hardware Sidecard)
+...
+```
+
+---
+
+## 各平台编译依赖参考
+
+| 操作系统 / 发行版 | 编译器与构建工具 | libcurl 开发依赖 |
+| :--- | :--- | :--- |
+| **macOS (arm64 / x86_64)** | `xcode-select --install` + `brew install cmake` | 系统 SDK 自带 |
+| **Debian / Ubuntu** | `build-essential` `cmake` | `libcurl4-openssl-dev` |
+| **Fedora / RHEL / Rocky** | `gcc-c++` `cmake` `make` | `libcurl-devel` |
+| **Arch Linux** | `base-devel` `cmake` | `curl` |
+| **Alpine Linux** | `g++` `cmake` `make` | `curl-dev` |
+
+第 3 维运行时编译器查找优先级：
+`PS5AI_CXX` → `PS5AI_GXX` → `$PS5AI_TOOLCHAIN/bin/g++` → `<可执行文件同级或上级>/toolchain/bin/g++` → `/usr/bin/g++` → `PATH` 中的 `g++` / `clang++` / `c++`。
+
+若需自行制作带便携 GCC 的 Linux Release 归档包：
+
+```bash
+bash scripts/fetch-toolchain.sh /tmp/11dim-tc
+bash scripts/pack-release.sh build /tmp/11dim-tc dist
+```
+
+---
+
+## 注意事项与安全说明
+
+1. **第 3 维沙盒信任边界**：第 3 维会在本机编译并执行被测模型返回的 C++ 代码。虽然子进程已设置独立进程组超时强杀、文件写入限制与（Linux 下）虚拟内存/进程数配额，但并非容器级强隔离，请仅对受信任的模型服务或主流云厂商 API 运行。
+2. **环境异常与模型零分区分**：若评测机缺少可用的 C++17 编译器或临时目录不可写，第 3 维会标记 `[ENV_ERROR]` 且程序以退出码 `3` 结束（报告照常写出），切勿将环境异常误判为模型代码能力 0 分。
+3. **单维容错**：若个别维度因网络超时或接口异常失败，该维记 `0` 分并自动继续后续维度，确保整轮报告顺利落盘。
+4. **伦理双维说明**：第 4 维与第 10 维复用同一组 6 条光谱探针请求结果，避免重复消耗推理配额；阅读综合均分时可结合单维明细一并参考。
 
 ---
 
 ## 许可证
 
-MIT。见 `LICENSE`。`third_party/nlohmann/json.hpp` 为 nlohmann/json 3.11.3，同为 MIT。
-
----
-
-## 名称对照
-
-| 说法 | 指什么 |
-| --- | --- |
-| 本仓库名 | `11-dim-local-LM-Test` |
-| 二进制名 | `ps5ai-11dim` |
-| 报告标题里的版本 | `v3.0 cpp` |
-| 我们内部旧称 | PS5AI 十一维 / C++ harness |
+本项目采用 [MIT License](LICENSE) 开源。仓库内置的 `third_party/nlohmann/json.hpp`（v3.11.3）同样遵循 MIT 许可证。
