@@ -42,6 +42,10 @@ Report build_report(const ReportInput& in) {
     md << "# 本地大模型十一维能力与性能评测报告 (v3.0 cpp)\n";
     md << "- **测试模型**: `" << in.model << "`\n";
     md << "- **接口地址**: `" << in.api_url << "`\n";
+    if (!in.api_mode.empty()) {
+        md << "- **接口模式**: `" << in.api_mode << "`"
+           << (in.temperature_omitted ? " (`temperature` 已按模式省略)" : "") << "\n";
+    }
     md << "- **评测时间**: `" << in.timestamp << "`\n";
     md << "- **代码沙盒**: `C++17 (-std=c++17 -pthread)`，编译器可以是便携 g++ 或本机的，维度 3 分数不可与旧版 Python asyncio 沙盒直接对比\n";
     md << "- **维度 3 编译器**: `" << in.dim3_compiler << "`";
@@ -77,7 +81,8 @@ Report build_report(const ReportInput& in) {
     md << "| **平均首字延迟 (TTFT)** | `" << fixed(avg_ttft * 1000.0, 1) << " ms` |\n";
     md << "| **平均生成速率** | `" << fixed(avg_tok, 1) << " tok/s` |\n";
     md << "| **评测进程峰值物理内存 (RSS)** | `" << fixed(in.peak_rss_mb, 1) << " MB` |\n";
-    md << "| **确定性稳定性方差 (@ Temp 0)** | `Variance = " << fixed(in.stability_variance, 2) << "` |\n";
+    md << "| **确定性稳定性方差 (@ Temp 0)** | `Variance = " << fixed(in.stability_variance, 2)
+       << (in.temperature_omitted ? " (temperature omitted)" : "") << "` |\n";
 
     nlohmann::ordered_json perf = nlohmann::ordered_json::object();
     for (const auto& item : in.perf) {
@@ -94,6 +99,10 @@ Report build_report(const ReportInput& in) {
     nlohmann::ordered_json root = nlohmann::ordered_json::object();
     root["model"] = in.model;
     root["api_url"] = in.api_url;
+    if (!in.api_mode.empty()) {
+        root["api_mode"] = in.api_mode;
+        root["temperature_omitted"] = in.temperature_omitted;
+    }
     root["overall"] = overall;
     root["env_error"] = in.env_error;
     root["env_error_details"] = in.env_error_details;

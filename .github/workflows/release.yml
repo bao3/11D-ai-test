@@ -8,10 +8,8 @@ on:
     tags: ['v*']
 
 jobs:
-  release:
+  build-linux:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
@@ -26,11 +24,76 @@ jobs:
         run: PS5AI_TOOLCHAIN="$HOME/ps5ai-toolchain" ./build/ps5ai-11dim --self-test
       - name: Pack archive
         run: bash scripts/pack-release.sh build "$HOME/ps5ai-toolchain" dist
-      - name: Publish GitHub Release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-amd64
+          path: dist/ps5ai-11dim-linux-amd64.tar.gz
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure cmake
+        run: command -v cmake >/dev/null 2>&1 || brew install cmake
+      - name: Configure and build universal binary (arm64 + x86_64)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          cmake --build build -j"$(sysctl -n hw.ncpu)"
+      - name: Self-test
+        run: ./build/ps5ai-11dim --self-test
+      - name: Pack macOS archive
+        run: |
+          NAME="ps5ai-11dim-macos-universal"
+          STAGE="$(mktemp -d)"
+          mkdir -p "${STAGE}/${NAME}" dist
+          cp build/ps5ai-11dim "${STAGE}/${NAME}/ps5ai-11dim"
+          chmod 0755 "${STAGE}/${NAME}/ps5ai-11dim"
+          strip -x "${STAGE}/${NAME}/ps5ai-11dim" || true
+          cat > "${STAGE}/${NAME}/README-run.txt" <<'EOF'
+          ps5ai-11dim macOS Universal (Apple Silicon arm64 + Intel x86_64)
+
+          1. 若系统提示未签名拦截，先移除隔离属性：
+             xattr -d com.apple.quarantine ./ps5ai-11dim 2>/dev/null || true
+
+          2. 第 3 维沙盒依赖系统 C++17 编译器（Xcode Command Line Tools）：
+             xcode-select --install
+
+          3. 离线自检与评测示例：
+             ./ps5ai-11dim --self-test
+             GEMINI_API_KEY="AIza..." ./ps5ai-11dim --api-mode gemini --model gemini-4-hydrogen
+             OPENAI_API_KEY="sk-..." ./ps5ai-11dim --api-mode openai --model gpt-5
+          EOF
+          (
+            cd "${STAGE}/${NAME}"
+            shasum -a 256 ./ps5ai-11dim ./README-run.txt > SHA256SUMS
+          )
+          tar -C "${STAGE}" -czf "dist/${NAME}.tar.gz" "${NAME}"
+          rm -rf "${STAGE}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-universal
+          path: dist/ps5ai-11dim-macos-universal.tar.gz
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build-linux, build-macos]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate SHA256SUMS and publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          cd release-assets
+          sha256sum *.tar.gz > SHA256SUMS
           TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$TAG" *.tar.gz SHA256SUMS \
             --title "$TAG" \
-            --notes "Self-contained linux-amd64 bundle with portable g++ toolchain for dimension 3. Rebuilds only when this tag points at a new commit. Does not replace older tags such as v1.0."
+            --notes "Release bundles for Linux amd64 (with portable g++ toolchain for dimension 3) and macOS Universal (arm64 + x86_64). Includes multi-provider OpenAI compatibility (--api-mode gemini/openai/anthropic/deepseek/openrouter/compat/local)."

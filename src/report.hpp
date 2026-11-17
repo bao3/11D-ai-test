@@ -24,6 +24,8 @@ struct ReportInput {
     std::vector<std::string> env_error_details;
     std::string dim3_compiler;
     std::string dim3_compiler_version;
+    std::string api_mode;
+    bool temperature_omitted = false;
 };
 
 struct Report {

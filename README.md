@@ -248,6 +248,8 @@ bash scripts/pack-release.sh build /tmp/ps5ai-tc dist
 
 ## 怎么跑一次正式评测
 
+### 1. 局域网本地模型（默认 PS5AI / `llama-server`）
+
 先确认服务已起来，再：
 
 ```bash
@@ -258,15 +260,73 @@ bash scripts/pack-release.sh build /tmp/ps5ai-tc dist
   --output benchmark_report_v3.md
 ```
 
+### 2. 云端与第三方 OpenAI 兼容接口（Gemini 4 / OpenAI / Claude / DeepSeek / OpenRouter 等）
+
+通过 `--api-mode`（默认 `auto`，也会根据 `--api-url` 域名自动识别）可一键适配各家 OpenAI 兼容接口的字段差异（自动剥离本地专用的 `enable_thinking` / `chat_template_kwargs`、为 OpenAI 切换 `max_completion_tokens`、为 Gemini 4 与推理模型省略已弃用的 `temperature`、并对 `429/5xx` 自动退避重试）：
+
+```bash
+# Google AI Studio Gemini 4（自动使用官方 OpenAI 兼容口并读取 GEMINI_API_KEY）
+GEMINI_API_KEY="AIza..." ./build/ps5ai-11dim \
+  --api-mode gemini \
+  --model gemini-4-hydrogen \
+  --output report_gemini4_hydrogen.md
+
+# GCP Vertex AI（自动读取本机 gcloud / ADC 凭证与默认项目，自动补全 google/ 前缀与 401 续期）
+./build/ps5ai-11dim \
+  --api-mode vertex \
+  --model gemini-3.8-flash \
+  --output report_gemini_3_8_flash.md
+
+./build/ps5ai-11dim \
+  --api-mode vertex \
+  --model gemini-4-hydrogen \
+  --output report_gemini_4_hydrogen.md
+
+# 指定推理档位测 Gemini 4 Carbon
+GEMINI_API_KEY="AIza..." ./build/ps5ai-11dim \
+  --api-mode gemini \
+  --model gemini-4-carbon \
+  --reasoning-effort high \
+  --output report_gemini4_carbon.md
+
+# OpenAI（自动切换 max_completion_tokens；o1/o3/o4/gpt-5 自动省略 temperature）
+OPENAI_API_KEY="sk-..." ./build/ps5ai-11dim \
+  --api-mode openai \
+  --model gpt-5 \
+  --output report_gpt5.md
+
+# Anthropic / DeepSeek / OpenRouter / 阿里百炼(qwen) / 硅基流动 / Ollama
+ANTHROPIC_API_KEY="sk-ant-..." ./build/ps5ai-11dim --api-mode anthropic --model claude-sonnet-4-5 --max-tokens 16384
+DEEPSEEK_API_KEY="sk-..." ./build/ps5ai-11dim --api-mode deepseek --model deepseek-reasoner --max-tokens 32768
+OPENROUTER_API_KEY="sk-or-..." ./build/ps5ai-11dim --api-mode openrouter --model google/gemini-4-argon
+./build/ps5ai-11dim --api-mode ollama --model qwen3:8b
+
+# 自建 OneAPI / NewAPI / LiteLLM 等标准 OpenAI 网关
+./build/ps5ai-11dim \
+  --api-mode compat \
+  --api-url https://your-gateway.example.com/v1/chat/completions \
+  --api-key sk-... \
+  --model your-model
+```
+
 常用参数：
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `--api-url` | `http://127.0.0.1:8081/v1/chat/completions` | 兼容接口完整 URL |
-| `--api-key` | `sk-local-test`（或环境变量 `PS5AI_API_KEY`） | Bearer |
-| `--model` | （必填，除非 `--self-test`） | 请求里的 model |
+| `--api-url` | `http://127.0.0.1:8081/v1/chat/completions`（或按 `--api-mode` 自动填充官方地址） | 兼容接口 URL（传 `/v1`、`/v1beta/openai` 或 `/endpoints/openapi` 根路径也会自动补全 `/chat/completions`） |
+| `--api-key` | `sk-local-test`（或 `PS5AI_API_KEY` / `GEMINI_API_KEY` / `OPENAI_API_KEY` / `vertex` 模式下本机 `gcloud` ADC） | Bearer 密钥 |
+| `--model` | （必填，除非 `--self-test`） | 请求里的 `model`（Vertex OpenAI 端点下裸 `gemini-*` 会自动补全为 `google/gemini-*`） |
+| `--api-mode` | `auto` | 兼容预设：`auto`、`local`(`ps5ai`)、`compat`、`gemini`、`vertex`、`openai`、`openai-reasoning`、`anthropic`、`deepseek`、`openrouter`、`xai`、`groq`、`mistral`、`dashscope`(`qwen`)、`siliconflow`、`moonshot`、`zhipu`、`ollama` |
+| `--vertex-project` | 自动读取 `GOOGLE_CLOUD_PROJECT` / ADC / `gcloud config` | GCP Vertex AI 项目 ID |
+| `--vertex-location` | `global`（或 `GOOGLE_CLOUD_LOCATION`） | GCP Vertex AI 区域（Gemini 3.8 / 4 推荐默认 `global`） |
+| `--max-tokens` | `65536` | 单次最大输出上限（若被测模型上限更小如 `8192`/`16384`，请按需调小或配 `--max-tokens-field none`） |
+| `--max-tokens-field` | `auto` | `auto`、`max_tokens`、`max_completion_tokens`、`none`（不发上限字段） |
+| `--temperature-mode` | `auto` | `auto`、`send`、`omit`（简写 `--omit-temperature`） |
+| `--thinking-off-fields` | `auto` | `auto`（仅 `local` 发送 `enable_thinking=false`）、`send`、`omit` |
+| `--reasoning-effort` | 空（不发送） | 可选推理强度（如 `low` / `medium` / `high`） |
+| `--retries` | `local` 为 `0`，云端为 `3` | 遇到 `HTTP 429 / 5xx` 时的自动退避重试次数（支持 `Retry-After`） |
+| `--header` | 无 | 附加自定义请求头（可多次传入，如 Azure `--header "api-key: ..."`） |
 | `--output` | `benchmark_report_v3.md` | Markdown 路径；JSON 写在旁边 |
-| `--max-tokens` | `65536` | 传给接口 |
 | `--timeout` | `2400` | 单次 HTTP 超时（秒） |
 | `--self-test` | 关 | 离线自检 |
 | `--help` | — | 帮助 |

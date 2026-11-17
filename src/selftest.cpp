@@ -354,6 +354,22 @@ int answer() { return 1; }
     auto blank = parse_chat_response(R"({"choices":[{"message":{"content":"  ","reasoning_content":"hi"}}]})");
     CHECK(blank.content == "hi");
     CHECK(blank.tokens == 1);
+    auto structured_parts = parse_chat_response(
+        R"({"choices":[{"message":{"content":[{"type":"thinking","text":"hidden"},{"type":"text","text":"可见"},{"type":"text","text":"回复"}]}}],"usage":{"output_tokens":5}})");
+    CHECK(structured_parts.content == "可见回复");
+    CHECK(structured_parts.tokens == 5);
+    CHECK(structured_parts.tokens_from_usage);
+    auto oai_refusal = parse_chat_response(
+        R"({"choices":[{"message":{"role":"assistant","content":null,"refusal":"I'm sorry, I cannot assist with that."}}]})");
+    CHECK(ethics_refused(oai_refusal.content));
+    auto safety_filtered = parse_chat_response(
+        R"({"choices":[{"finish_reason":"content_filter","message":{"role":"assistant","content":null}}]})");
+    CHECK(safety_filtered.content_filtered);
+    CHECK(ethics_refused(safety_filtered.content));
+    auto gemini_prompt_blocked = parse_chat_response(
+        R"({"choices":[],"promptFeedback":{"blockReason":"SAFETY"}})");
+    CHECK(gemini_prompt_blocked.content_filtered);
+    CHECK(ethics_refused(gemini_prompt_blocked.content));
     bool threw = false;
     try {
         parse_chat_response(R"({"error":{"message":"nope"}})");
@@ -361,6 +377,123 @@ int answer() { return 1; }
         threw = true;
     }
     CHECK(threw);
+
+    // Multi-provider OpenAI compatibility checks
+    CHECK(resolve_api_mode(ApiMode::Auto, "http://127.0.0.1:8081/v1/chat/completions") == ApiMode::Local);
+    CHECK(resolve_api_mode(ApiMode::Auto, "http://192.168.50.218:8081/v1/chat/completions") == ApiMode::Local);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions") ==
+          ApiMode::Gemini);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://api.openai.com/v1/chat/completions") == ApiMode::OpenAI);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://demo.openai.azure.com/openai/deployments/x/chat/completions") ==
+          ApiMode::OpenAI);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://api.anthropic.com/v1/chat/completions") == ApiMode::Anthropic);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://api.deepseek.com/v1/chat/completions") == ApiMode::DeepSeek);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://openrouter.ai/api/v1/chat/completions") == ApiMode::OpenRouter);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://api.x.ai/v1/chat/completions") == ApiMode::XAI);
+    CHECK(resolve_api_mode(ApiMode::Auto, "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions") ==
+          ApiMode::Compat);
+    CHECK(resolve_api_mode(ApiMode::Auto, "http://127.0.0.1:11434/v1/chat/completions") == ApiMode::Compat);
+
+    CHECK(normalize_chat_completions_url("https://generativelanguage.googleapis.com/v1beta/openai") ==
+          "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+    CHECK(normalize_chat_completions_url("https://generativelanguage.googleapis.com/v1beta/openai/") ==
+          "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+    CHECK(normalize_chat_completions_url(
+              "https://aiplatform.googleapis.com/v1/projects/demo-proj/locations/global/endpoints/openapi") ==
+          "https://aiplatform.googleapis.com/v1/projects/demo-proj/locations/global/endpoints/openapi/chat/completions");
+    CHECK(build_vertex_chat_completions_url("demo-proj", "global") ==
+          "https://aiplatform.googleapis.com/v1/projects/demo-proj/locations/global/endpoints/openapi/chat/completions");
+    CHECK(build_vertex_chat_completions_url("demo-proj", "us-central1") ==
+          "https://us-central1-aiplatform.googleapis.com/v1/projects/demo-proj/locations/us-central1/endpoints/openapi/chat/completions");
+    CHECK(parse_api_mode("vertex") == ApiMode::Gemini);
+    CHECK(is_vertex_mode_token("vertex"));
+    CHECK(normalize_model_for_endpoint(
+              "gemini-3.8-flash",
+              "https://aiplatform.googleapis.com/v1/projects/demo/locations/global/endpoints/openapi/chat/completions") ==
+          "google/gemini-3.8-flash");
+    CHECK(normalize_model_for_endpoint(
+              "google/gemini-4-hydrogen",
+              "https://aiplatform.googleapis.com/v1/projects/demo/locations/global/endpoints/openapi/chat/completions") ==
+          "google/gemini-4-hydrogen");
+    CHECK(normalize_chat_completions_url("https://api.openai.com/v1?foo=1") ==
+          "https://api.openai.com/v1/chat/completions?foo=1");
+    CHECK(normalize_chat_completions_url("http://192.168.50.218:8081/v1/chat/completions") ==
+          "http://192.168.50.218:8081/v1/chat/completions");
+    CHECK(default_url_for_mode_token("gemini") ==
+          "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions");
+    CHECK(default_url_for_mode_token("openai") == "https://api.openai.com/v1/chat/completions");
+
+    {
+        LlmClient local_cli;
+        local_cli.api_url = "http://192.168.50.218:8081/v1/chat/completions";
+        local_cli.api_mode = ApiMode::Auto;
+        local_cli.model = "ps5-latest";
+        const auto j = nlohmann::json::parse(local_cli.build_request_body({{"user", "hi"}}, 0.2));
+        CHECK(j["enable_thinking"] == false);
+        CHECK(j["chat_template_kwargs"]["enable_thinking"] == false);
+        CHECK(j["max_tokens"] == 65536);
+        CHECK(near(j["temperature"].get<double>(), 0.2));
+    }
+    {
+        LlmClient gemini_cli;
+        gemini_cli.api_url = default_url_for_mode_token("gemini");
+        gemini_cli.api_mode = ApiMode::Auto;
+        gemini_cli.model = "gemini-4-carbon";
+        gemini_cli.reasoning_effort = "high";
+        const auto j = nlohmann::json::parse(gemini_cli.build_request_body({{"user", "hi"}}, 0.0));
+        CHECK(!j.contains("enable_thinking"));
+        CHECK(!j.contains("chat_template_kwargs"));
+        CHECK(!j.contains("temperature"));
+        CHECK(j["max_tokens"] == 65536);
+        CHECK(j["reasoning_effort"] == "high");
+
+        LlmClient vertex_cli;
+        vertex_cli.api_url = build_vertex_chat_completions_url("demo-proj", "global");
+        vertex_cli.api_mode = ApiMode::Auto;
+        vertex_cli.model = "gemini-4-hydrogen";
+        const auto jv = nlohmann::json::parse(vertex_cli.build_request_body({{"user", "hi"}}, 0.2));
+        CHECK(jv["model"] == "google/gemini-4-hydrogen");
+        CHECK(!jv.contains("temperature"));
+        CHECK(!jv.contains("enable_thinking"));
+    }
+    {
+        LlmClient oai_cli;
+        oai_cli.api_url = default_url_for_mode_token("openai");
+        oai_cli.api_mode = ApiMode::Auto;
+        oai_cli.model = "gpt-4o";
+        const auto j4o = nlohmann::json::parse(oai_cli.build_request_body({{"user", "hi"}}, 0.0));
+        CHECK(!j4o.contains("enable_thinking"));
+        CHECK(!j4o.contains("max_tokens"));
+        CHECK(j4o["max_completion_tokens"] == 65536);
+        CHECK(j4o.contains("temperature"));
+
+        oai_cli.model = "gpt-5";
+        const auto j5 = nlohmann::json::parse(oai_cli.build_request_body({{"user", "hi"}}, 0.0));
+        CHECK(j5["max_completion_tokens"] == 65536);
+        CHECK(!j5.contains("temperature"));
+    }
+    {
+        LlmClient compat_cli;
+        compat_cli.api_url = "https://openrouter.ai/api/v1/chat/completions";
+        compat_cli.api_mode = ApiMode::Auto;
+        compat_cli.model = "qwen/qwen3-coder";
+        const auto jq = nlohmann::json::parse(compat_cli.build_request_body({{"user", "hi"}}, 0.1));
+        CHECK(!jq.contains("enable_thinking"));
+        CHECK(!jq.contains("chat_template_kwargs"));
+        CHECK(jq["max_tokens"] == 65536);
+        CHECK(jq.contains("temperature"));
+
+        compat_cli.model = "google/gemini-4-hydrogen";
+        const auto jg = nlohmann::json::parse(compat_cli.build_request_body({{"user", "hi"}}, 0.1));
+        CHECK(!jg.contains("temperature"));
+
+        compat_cli.max_tokens_field = MaxTokensField::None;
+        compat_cli.temperature_policy = TriState::Send;
+        const auto joverride = nlohmann::json::parse(compat_cli.build_request_body({{"user", "hi"}}, 0.0));
+        CHECK(!joverride.contains("max_tokens"));
+        CHECK(!joverride.contains("max_completion_tokens"));
+        CHECK(joverride.contains("temperature"));
+    }
 
     const std::string long_path = fixture("long_context_12000.txt");
     CHECK(!long_path.empty());

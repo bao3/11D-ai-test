@@ -90,6 +90,13 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
         close(err_pipe[1]);
         if (opt.limit_resources) {
             struct rlimit rl {};
+            rl.rlim_cur = 8;
+            rl.rlim_max = 8;
+            setrlimit(RLIMIT_CPU, &rl);
+            rl.rlim_cur = 16ull << 20;
+            rl.rlim_max = rl.rlim_cur;
+            setrlimit(RLIMIT_FSIZE, &rl);
+#if !defined(__APPLE__)
             // glibc sizes every new thread's stack from RLIMIT_STACK unless it is
             // unlimited (then ~2MB). GitHub-hosted runners often inherit 32MB+.
             // A handful of std::threads then cannot fit in RLIMIT_AS: pthread_create
@@ -107,12 +114,9 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
                     setrlimit(RLIMIT_STACK, &rl);
                 }
             }
-            rl.rlim_cur = 8;
-            rl.rlim_max = 8;
-            setrlimit(RLIMIT_CPU, &rl);
-            rl.rlim_cur = 16ull << 20;
-            rl.rlim_max = rl.rlim_cur;
-            setrlimit(RLIMIT_FSIZE, &rl);
+            // macOS maps the dyld shared cache (hundreds of GBs of virtual address
+            // space) into every process and enforces lower per-UID RLIMIT_NPROC caps,
+            // so RLIMIT_AS / RLIMIT_NPROC are applied on Linux only.
             rl.rlim_cur = 256ull << 20;
             rl.rlim_max = rl.rlim_cur;
             setrlimit(RLIMIT_AS, &rl);
@@ -120,6 +124,7 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
             rl.rlim_cur = 8192;
             rl.rlim_max = 8192;
             setrlimit(RLIMIT_NPROC, &rl);
+#endif
         }
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);

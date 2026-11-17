@@ -33,13 +33,26 @@ struct Options {
     std::string output = "benchmark_report_v3.md";
     int max_tokens = 65536;
     int timeout_s = 2400;
+    ApiMode api_mode = ApiMode::Auto;
+    std::string api_mode_token = "auto";
+    MaxTokensField max_tokens_field = MaxTokensField::Auto;
+    TriState temperature_policy = TriState::Auto;
+    TriState thinking_off_policy = TriState::Auto;
+    std::string reasoning_effort;
+    std::string vertex_project;
+    std::string vertex_location;
+    std::function<std::string()> token_refresher;
+    int retries = -1;
+    std::vector<std::string> extra_headers;
+    bool api_url_explicit = false;
+    bool api_key_explicit = false;
     bool self_test = false;
     bool help = false;
 };
 
 void print_help() {
     std::cout
-        << "ps5ai-11dim — PS5AI eleven-dimension local LLM benchmark (C++17)\n"
+        << "ps5ai-11dim — PS5AI eleven-dimension LLM benchmark (C++17, Linux & macOS)\n"
         << "\n"
         << "Usage:\n"
         << "  ps5ai-11dim --model <name> [options]\n"
@@ -47,21 +60,41 @@ void print_help() {
         << "  ps5ai-11dim --help\n"
         << "\n"
         << "Options:\n"
-        << "  --api-url <url>     OpenAI-compatible chat completions endpoint\n"
-        << "                      (default: http://127.0.0.1:8081/v1/chat/completions)\n"
-        << "  --api-key <key>     Bearer token (default: sk-local-test, or env PS5AI_API_KEY)\n"
-        << "  --model <name>      Model id sent in the request body (required for a live run)\n"
-        << "  --output <path>     Markdown report path (default: benchmark_report_v3.md)\n"
-        << "                      A JSON sidecar is written next to it.\n"
-        << "  --max-tokens <n>    max_tokens sent to the API (default: 65536)\n"
-        << "  --timeout <sec>     Per-request timeout (default: 2400)\n"
-        << "  --self-test         Score math/Chinese/JSON/sandbox offline. No LLM.\n"
-        << "  --help              Show this help\n"
+        << "  --api-url <url>               OpenAI-compatible chat completions endpoint\n"
+        << "                                (default: http://127.0.0.1:8081/v1/chat/completions,\n"
+        << "                                or provider default when --api-mode names a cloud provider)\n"
+        << "  --api-key <key>               Bearer token (or env PS5AI_API_KEY / GEMINI_API_KEY /\n"
+        << "                                OPENAI_API_KEY / ANTHROPIC_API_KEY / gcloud ADC on vertex)\n"
+        << "  --model <name>                Model id sent in the request body (required for a live run)\n"
+        << "  --api-mode <mode>             Provider compatibility preset (default: auto):\n"
+        << "                                  auto             Detect from --api-url (falls back to local)\n"
+        << "                                  local / ps5ai    llama-server/vLLM (sends enable_thinking=false)\n"
+        << "                                  compat           Strict standard OpenAI /v1/chat/completions\n"
+        << "                                  gemini           Google AI Studio Gemini (omits temperature)\n"
+        << "                                  vertex           GCP Vertex AI OpenAI endpoint (auto gcloud/ADC)\n"
+        << "                                  openai           OpenAI / Azure (uses max_completion_tokens)\n"
+        << "                                  openai-reasoning OpenAI o-series / GPT-5 (omits temperature)\n"
+        << "                                  anthropic        Anthropic OpenAI-compat endpoint\n"
+        << "                                  deepseek / openrouter / xai / groq / mistral /\n"
+        << "                                  dashscope / siliconflow / moonshot / zhipu / ollama\n"
+        << "  --vertex-project <id>         GCP project ID for Vertex AI (or GOOGLE_CLOUD_PROJECT / gcloud)\n"
+        << "  --vertex-location <loc>       GCP Vertex location (default: global)\n"
+        << "  --max-tokens <n>              Token cap sent to the API (default: 65536)\n"
+        << "  --max-tokens-field <field>    auto | max_tokens | max_completion_tokens | none\n"
+        << "  --temperature-mode <policy>   auto | send | omit (shorthand: --omit-temperature)\n"
+        << "  --thinking-off-fields <pol>   auto | send | omit (controls enable_thinking=false fields)\n"
+        << "  --reasoning-effort <level>    Optional OpenAI/Gemini reasoning_effort (e.g. low|medium|high)\n"
+        << "  --retries <n>                 Retries on HTTP 429/5xx (default: 0 for local, 3 for cloud)\n"
+        << "  --header <K: V>               Extra HTTP header (repeatable, e.g. Azure api-key)\n"
+        << "  --output <path>               Markdown report path (default: benchmark_report_v3.md)\n"
+        << "                                A JSON sidecar is written next to it.\n"
+        << "  --timeout <sec>               Per-request timeout (default: 2400)\n"
+        << "  --self-test                   Score math/Chinese/JSON/sandbox/HTTP modes offline. No LLM.\n"
+        << "  --help                        Show this help\n"
         << "\n"
         << "Dimension 3 compiles model output with -std=c++17 -pthread and runs it.\n"
         << "Compiler order: PS5AI_CXX, PS5AI_GXX, PS5AI_TOOLCHAIN, bundled toolchain, then g++/clang++/c++.\n"
-        << "Those scores are not comparable to the old Python asyncio sandbox.\n"
-        << "Thinking is disabled (enable_thinking=false, chat_template_kwargs.enable_thinking=false).\n";
+        << "Those scores are not comparable to the old Python asyncio sandbox.\n";
 }
 
 std::string need_value(int& i, int argc, char** argv, const std::string& flag) {
@@ -87,6 +120,29 @@ int to_positive(const std::string& text, const std::string& flag) {
     }
 }
 
+int to_non_negative(const std::string& text, const std::string& flag) {
+    try {
+        std::size_t used = 0;
+        const int value = std::stoi(text, &used);
+        if (used != text.size() || value < 0) {
+            throw UsageError(flag + " must be a non-negative integer");
+        }
+        return value;
+    } catch (const UsageError&) {
+        throw;
+    } catch (const std::exception&) {
+        throw UsageError(flag + " must be a non-negative integer");
+    }
+}
+
+bool match_flag(const std::string& arg, const std::string& flag) {
+    if (arg == flag) {
+        return true;
+    }
+    const std::string prefix = flag + "=";
+    return arg.compare(0, prefix.size(), prefix) == 0;
+}
+
 Options parse_args(int argc, char** argv) {
     Options opt;
     for (int i = 1; i < argc; ++i) {
@@ -96,42 +152,63 @@ Options parse_args(int argc, char** argv) {
             if (arg == flag) {
                 return need_value(i, argc, argv, flag);
             }
-            if (arg.compare(0, prefix.size(), prefix) == 0) {
-                return arg.substr(prefix.size());
-            }
-            return std::string();
+            return arg.substr(prefix.size());
         };
         if (arg == "--help" || arg == "-h") {
             opt.help = true;
         } else if (arg == "--self-test") {
             opt.self_test = true;
-        } else if (arg.rfind("--api-url", 0) == 0) {
-            const std::string value = take("--api-url");
-            if (value.empty() && arg != "--api-url") {
-                throw UsageError("unknown argument: " + arg);
+        } else if (arg == "--omit-temperature") {
+            opt.temperature_policy = TriState::Omit;
+        } else if (match_flag(arg, "--api-url")) {
+            opt.api_url = take("--api-url");
+            opt.api_url_explicit = true;
+        } else if (match_flag(arg, "--api-key")) {
+            opt.api_key = take("--api-key");
+            opt.api_key_explicit = true;
+        } else if (match_flag(arg, "--model")) {
+            opt.model = take("--model");
+        } else if (match_flag(arg, "--output")) {
+            opt.output = take("--output");
+        } else if (match_flag(arg, "--api-mode")) {
+            const std::string token = take("--api-mode");
+            try {
+                opt.api_mode = parse_api_mode(token);
+                opt.api_mode_token = token;
+            } catch (const std::exception& ex) {
+                throw UsageError(ex.what());
             }
-            opt.api_url = value;
-        } else if (arg.rfind("--api-key", 0) == 0) {
-            const std::string value = take("--api-key");
-            if (value.empty() && arg != "--api-key") {
-                throw UsageError("unknown argument: " + arg);
+        } else if (match_flag(arg, "--max-tokens-field")) {
+            try {
+                opt.max_tokens_field = parse_max_tokens_field(take("--max-tokens-field"));
+            } catch (const std::exception& ex) {
+                throw UsageError(ex.what());
             }
-            opt.api_key = value;
-        } else if (arg.rfind("--model", 0) == 0) {
-            const std::string value = take("--model");
-            if (value.empty() && arg != "--model") {
-                throw UsageError("unknown argument: " + arg);
+        } else if (match_flag(arg, "--temperature-mode")) {
+            try {
+                opt.temperature_policy = parse_tri_state(take("--temperature-mode"));
+            } catch (const std::exception& ex) {
+                throw UsageError(ex.what());
             }
-            opt.model = value;
-        } else if (arg.rfind("--output", 0) == 0) {
-            const std::string value = take("--output");
-            if (value.empty() && arg != "--output") {
-                throw UsageError("unknown argument: " + arg);
+        } else if (match_flag(arg, "--thinking-off-fields")) {
+            try {
+                opt.thinking_off_policy = parse_tri_state(take("--thinking-off-fields"));
+            } catch (const std::exception& ex) {
+                throw UsageError(ex.what());
             }
-            opt.output = value;
-        } else if (arg.rfind("--max-tokens", 0) == 0) {
+        } else if (match_flag(arg, "--reasoning-effort")) {
+            opt.reasoning_effort = take("--reasoning-effort");
+        } else if (match_flag(arg, "--vertex-project")) {
+            opt.vertex_project = take("--vertex-project");
+        } else if (match_flag(arg, "--vertex-location")) {
+            opt.vertex_location = take("--vertex-location");
+        } else if (match_flag(arg, "--retries")) {
+            opt.retries = to_non_negative(take("--retries"), "--retries");
+        } else if (match_flag(arg, "--header")) {
+            opt.extra_headers.push_back(take("--header"));
+        } else if (match_flag(arg, "--max-tokens")) {
             opt.max_tokens = to_positive(take("--max-tokens"), "--max-tokens");
-        } else if (arg.rfind("--timeout", 0) == 0) {
+        } else if (match_flag(arg, "--timeout")) {
             opt.timeout_s = to_positive(take("--timeout"), "--timeout");
         } else {
             throw UsageError("unknown argument: " + arg);
@@ -196,11 +273,31 @@ int run_benchmark(const Options& opt) {
     client.model = opt.model;
     client.max_tokens = opt.max_tokens;
     client.timeout_s = opt.timeout_s;
+    client.api_mode = opt.api_mode;
+    client.max_tokens_field = opt.max_tokens_field;
+    client.temperature_policy = opt.temperature_policy;
+    client.thinking_off_policy = opt.thinking_off_policy;
+    client.reasoning_effort = opt.reasoning_effort;
+    client.extra_headers = opt.extra_headers;
+    client.token_refresher = opt.token_refresher;
+
+    const ApiMode eff_mode = client.effective_mode();
+    client.max_retries = opt.retries >= 0 ? opt.retries : (eff_mode == ApiMode::Local ? 0 : 3);
+    const bool temp_omitted = client.omits_temperature_for_request();
+    const std::string wire_model = normalize_model_for_endpoint(opt.model, client.api_url);
 
     const std::string cxx = resolve_cxx_compiler();
     const std::string cxx_ver = cxx_version_line(cxx);
     std::cout << std::string(78, '=') << "\n";
-    std::cout << "PS5AI 十一维评测 | 模型: " << opt.model << "\n";
+    std::cout << "PS5AI 十一维评测 | 模型: " << opt.model;
+    if (wire_model != opt.model) {
+        std::cout << " (请求 ID: " << wire_model << ")";
+    }
+    std::cout << "\n";
+    std::cout << "接口地址: " << client.api_url << "\n";
+    std::cout << "接口模式: " << api_mode_name(eff_mode)
+              << (temp_omitted ? " (已省略 temperature)" : "")
+              << " | 限流重试: " << client.max_retries << "\n";
     std::cout << "维度 3 编译器: " << cxx;
     if (!cxx_ver.empty()) {
         std::cout << " (" << cxx_ver << ")";
@@ -420,7 +517,7 @@ int run_benchmark(const Options& opt) {
 
     ReportInput input;
     input.model = opt.model;
-    input.api_url = opt.api_url;
+    input.api_url = client.api_url;
     input.timestamp = now_stamp();
     input.ethics_summary = ethics_summary_str;
     input.scores = scores;
@@ -432,6 +529,8 @@ int run_benchmark(const Options& opt) {
     input.env_error_details = env_error_details;
     input.dim3_compiler = cxx;
     input.dim3_compiler_version = cxx_ver;
+    input.api_mode = api_mode_name(eff_mode);
+    input.temperature_omitted = temp_omitted;
     const Report report = build_report(input);
     write_report_files(opt.output, report);
 
@@ -450,22 +549,6 @@ int run_benchmark(const Options& opt) {
 int main(int argc, char** argv) {
     try {
         Options opt = parse_args(argc, argv);
-        // Prefer explicit --api-key; otherwise allow PS5AI_API_KEY (avoids putting secrets only on argv).
-        bool api_key_on_argv = false;
-        for (int i = 1; i < argc; ++i) {
-            const std::string a = argv[i];
-            if (a == "--api-key" || a.rfind("--api-key=", 0) == 0) {
-                api_key_on_argv = true;
-                break;
-            }
-        }
-        if (!api_key_on_argv) {
-            if (const char* env = std::getenv("PS5AI_API_KEY")) {
-                if (env[0] != '\0') {
-                    opt.api_key = env;
-                }
-            }
-        }
         if (opt.help) {
             print_help();
             return 0;
@@ -478,6 +561,56 @@ int main(int argc, char** argv) {
             print_help();
             return 2;
         }
+
+        const bool want_vertex_url =
+            !opt.api_url_explicit && (is_vertex_mode_token(opt.api_mode_token) || !opt.vertex_project.empty());
+        if (!opt.api_url_explicit && !want_vertex_url) {
+            const std::string preset_url = default_url_for_mode_token(opt.api_mode_token);
+            if (!preset_url.empty()) {
+                opt.api_url = preset_url;
+            }
+        }
+        opt.api_url = normalize_chat_completions_url(opt.api_url);
+
+        const bool target_is_vertex =
+            want_vertex_url || is_vertex_mode_token(opt.api_mode_token) ||
+            opt.api_url.find("aiplatform.googleapis.com") != std::string::npos;
+
+        if (target_is_vertex) {
+            const VertexConfig vcfg =
+                resolve_vertex_config(opt.vertex_project, opt.vertex_location, !opt.api_key_explicit);
+            if (want_vertex_url) {
+                if (vcfg.project.empty()) {
+                    throw UsageError(
+                        "GCP Vertex project ID not found; pass --vertex-project <PROJECT_ID>, "
+                        "set GOOGLE_CLOUD_PROJECT, or run 'gcloud config set project <PROJECT_ID>'");
+                }
+                opt.api_url = build_vertex_chat_completions_url(vcfg.project, vcfg.location);
+            }
+            if (!opt.api_key_explicit) {
+                if (!vcfg.access_token.empty()) {
+                    opt.api_key = vcfg.access_token;
+                }
+                const std::string proj = opt.vertex_project;
+                const std::string loc = opt.vertex_location;
+                opt.token_refresher = [proj, loc]() {
+                    return resolve_vertex_config(proj, loc, true).access_token;
+                };
+            }
+        } else if (!opt.api_key_explicit) {
+            const ApiMode resolved_mode = resolve_api_mode(opt.api_mode, opt.api_url);
+            // Prefer explicit --api-key; otherwise check PS5AI_API_KEY, provider-specific
+            // env var (e.g. GEMINI_API_KEY / ANTHROPIC_API_KEY), and OPENAI_API_KEY.
+            for (const auto& key_name : api_key_env_candidates(resolved_mode, opt.api_mode_token)) {
+                if (const char* env = std::getenv(key_name.c_str())) {
+                    if (env[0] != '\0') {
+                        opt.api_key = env;
+                        break;
+                    }
+                }
+            }
+        }
+
         return run_benchmark(opt);
     } catch (const UsageError& ex) {
         std::cerr << "error: " << ex.what() << "\n\n";
